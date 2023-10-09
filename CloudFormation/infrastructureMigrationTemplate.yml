@@ -1,22 +1,25 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >-
   Features:
-  v1:  
-    - 1 vpn with 2 AZs, each with one private and public subnet
-    - 1 ansible node in public subnet with external ssh access
-    - 1 jenkins node in public subnet with only 8080 external access and internal ssh access
-    - 1 server in private subnet and internal ssh access
-    - 2 nat gateways in each public subnet
-  v2:
-    - Added a route53 internal DNS
-    - Created parameters grouping and ordering
-  v3:
-    - created eks cluster
+      - 1 VPC with 2 AZs, each with one private and public subnet
+      - 1 internet gateway 
+      - 1 route 53 internal DNS      
+      - 2 nat gateways in each public subnet
+      - 1 ansible node in public subnet with external ssh access
+      - 1 jenkins node in public subnet with only 8080 external access and internal ssh access
+      - 1 server in private subnet and internal ssh access
+      - 1 EKS cluster
+      - 1 S3 backups bucket
     
 ############################ PARAMETERS GROUP AND ORDER DEFINITION ############################    
 Metadata: 
   AWS::CloudFormation::Interface: 
     ParameterGroups: 
+      - 
+        Label: 
+          default: "Buckets"
+        Parameters: 
+          - BackupsBucketName
       - 
         Label: 
           default: "Network Configuration"
@@ -56,6 +59,13 @@ Metadata:
 
 ############################ PARAMETERS ############################  
 Parameters:
+### Network Configuration
+  BackupsBucketName:
+    Description: >-
+      Backups Bucket Name
+    Type: String
+    Default: backups-bucket-ccbbaa112233
+    ConstraintDescription: must be unique or else it will fail
 ### Network Configuration
   CIDRVPC:
     Description: >-
@@ -679,6 +689,17 @@ Resources:
       SubnetId: !Ref K8sPrivateSubnetAZ2
       RouteTableId: !Ref K8SPrivateRouteTableAZ2      
       
+ ############################ BACKUPS BUCKET ############################   
+  BackupsBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref BackupsBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+ 
  ############################ Jenkins INSTANCE ############################   
  
   JenkinsEC2Instance:
@@ -701,17 +722,63 @@ Resources:
       UserData: 
         Fn::Base64: !Sub |
           #!/bin/bash -x
-          yum install docker
+          yum install docker -y
           systemctl enable docker
           usermod -a -G docker ec2-user
           id ec2-user
           newgrp docker
-          
+          sudo yum install cronie -y
+          sudo systemctl enable crond.service
+          crontab -l | { cat; echo "* * * 2 * aws s3 cp --recursive /var/lib/jenkins/ s3://${BackupsBucketName}/Jenkins/\$(date +\%Y-\%m-\%d)/"; } | crontab -
+
+  JenkinsNodeRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BackupsBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${BackupsBucketName}'
+        - PolicyName: ECRFullAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:GetRepositoryPolicy'
+                  - 'ecr:ListImages'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:GetLifecyclePolicy'
+                  - 'ecr:GetLifecyclePolicyPreview'
+                  - 'ecr:GetImage'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetObject'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                Resource: !GetAtt ECR.Arn
+        
   JenkinsInstanceProfile:
     Type: 'AWS::IAM::InstanceProfile'
     Properties:
       Roles:
-        - !Ref EcrNodeRole
+        - !Ref JenkinsNodeRole
 
   JenkinsInstanceSecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
@@ -741,6 +808,7 @@ Resources:
       TTL: 60
       ResourceRecords:
         - !GetAtt JenkinsEC2Instance.PrivateIp 
+
         
  ############################ ANSIBLE INSTANCE ############################          
   AnsibleEC2Instance:
